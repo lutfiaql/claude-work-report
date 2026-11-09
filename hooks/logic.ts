@@ -245,6 +245,10 @@ export type Sum = {
   kinds: Record<KindId, number>
   models: Record<string, number>
   projects: Record<string, number>
+  /** Milliseconds Claude spent working on these tasks (measured, not estimated). */
+  ms: number
+  /** Tasks by the local hour they started, midnight first. */
+  hours: number[]
 }
 
 export function emptySum(): Sum {
@@ -253,6 +257,8 @@ export function emptySum(): Sum {
     kinds: { emails: 0, documents: 0, images: 0, coding: 0, research: 0, other: 0 },
     models: {},
     projects: {},
+    ms: 0,
+    hours: new Array<number>(24).fill(0),
   }
 }
 
@@ -276,12 +282,26 @@ export function sumDays(days: Readonly<Record<string, DayRecord>>, keys: readonl
     }
     for (const [model, n] of Object.entries(day.models)) sum.models[model] = (sum.models[model] ?? 0) + n
     for (const [project, n] of Object.entries(day.projects ?? {})) sum.projects[project] = (sum.projects[project] ?? 0) + n
+    sum.ms += day.ms ?? 0
+    day.hours?.forEach((n, hour) => {
+      if (hour < 24) sum.hours[hour] = (sum.hours[hour] ?? 0) + n
+    })
   }
   return sum
 }
 
 /** One finished task added to a day's record. */
-export function addTask(day: DayRecord | undefined, kind: KindId, model: string, project?: string): DayRecord {
+export type TaskExtra = {
+  /** How long Claude worked on it, in milliseconds. */
+  ms?: number
+  /** The local hour it started, 0 to 23. */
+  hour?: number
+}
+
+/** The longest Claude may have worked on one task: anything longer is a session left open. */
+export const MAX_TASK_MS = 4 * 60 * 60 * 1000
+
+export function addTask(day: DayRecord | undefined, kind: KindId, model: string, project?: string, extra: TaskExtra = {}): DayRecord {
   const base: DayRecord = day ?? { kinds: {}, models: {} }
   const next: DayRecord = {
     kinds: { ...base.kinds, [kind]: (base.kinds[kind] ?? 0) + 1 },
@@ -291,7 +311,91 @@ export function addTask(day: DayRecord | undefined, kind: KindId, model: string,
     next.projects = { ...(base.projects ?? {}) }
     if (project !== undefined) next.projects[project] = (next.projects[project] ?? 0) + 1
   }
+  const ms = extra.ms !== undefined && extra.ms > 0 ? Math.min(MAX_TASK_MS, Math.round(extra.ms)) : 0
+  if (ms > 0 || base.ms !== undefined) next.ms = (base.ms ?? 0) + ms
+  if (extra.hour !== undefined || base.hours !== undefined) {
+    const hours = base.hours ? [...base.hours] : new Array<number>(24).fill(0)
+    if (extra.hour !== undefined && extra.hour >= 0 && extra.hour < 24) hours[extra.hour] = (hours[extra.hour] ?? 0) + 1
+    next.hours = hours
+  }
   return next
+}
+
+/** The most days in a row with a task, in all the days given. */
+export function longestStreak(days: Readonly<Record<string, DayRecord>>): number {
+  const active = Object.keys(days)
+    .filter(k => dayTotal(days[k]) > 0)
+    .sort()
+  let best = 0
+  let run = 0
+  let previous = ''
+  for (const key of active) {
+    run = previous !== '' && addDays(previous, 1) === key ? run + 1 : 1
+    best = Math.max(best, run)
+    previous = key
+  }
+  return best
+}
+
+/** The busiest two-hour window of the day, as `3 pm – 5 pm`, or null with no tasks. */
+export function peakWindow(hours: readonly number[]): { start: number; label: string } | null {
+  let best = -1
+  let start = 0
+  for (let hour = 0; hour < 24; hour++) {
+    const n = (hours[hour] ?? 0) + (hours[(hour + 1) % 24] ?? 0)
+    // On a tie, the window that starts on the busier hour.
+    if (n > best || (n === best && (hours[hour] ?? 0) > (hours[start] ?? 0))) {
+      best = n
+      start = hour
+    }
+  }
+  if (best <= 0) return null
+  return { start, label: `${clockHour(start)} – ${clockHour((start + 2) % 24)}` }
+}
+
+/** 0 reads `12 am`, 15 reads `3 pm`. */
+export function clockHour(hour: number): string {
+  const twelve = hour % 12 === 0 ? 12 : hour % 12
+  return `${twelve} ${hour < 12 ? 'am' : 'pm'}`
+}
+
+/** A measured duration: `45 min`, `3.2 h`, `18 h`. */
+export function formatDuration(ms: number): string {
+  const minutes = ms / 60000
+  if (minutes < 1) return ms > 0 ? '<1 min' : '0 min'
+  if (minutes < 60) return `${Math.round(minutes)} min`
+  return `${formatHours(minutes)} h`
+}
+
+/** Estimated time saved over Claude's measured working time, as `4.4×`, or null when either is zero. */
+export function leverage(savedMinutes: number, workedMs: number): string | null {
+  if (savedMinutes <= 0 || workedMs < 60000) return null
+  const ratio = savedMinutes / (workedMs / 60000)
+  return `${ratio < 10 ? ratio.toFixed(1) : Math.round(ratio)}×`
+}
+
+/** Every day in `keys` as CSV: date, tasks per kind, total, minutes saved (estimate), Claude's minutes. */
+export function csvOf(days: Readonly<Record<string, DayRecord>>, keys: readonly string[], settings: Settings): string {
+  const header = ['date', ...KINDS.map(k => k.id), 'tasks', 'minutes_saved_estimate', 'value_estimate', 'claude_minutes']
+  const lines = [header.join(',')]
+  for (const key of keys) {
+    const day = days[key]
+    const total = dayTotal(day)
+    if (total === 0) continue
+    const sum = sumDays(days, [key])
+    const minutes = minutesOf(sum, settings)
+    lines.push(
+      [
+        key,
+        ...KINDS.map(k => String(sum.kinds[k.id])),
+        String(total),
+        String(Math.round(minutes)),
+        ((minutes / 60) * settings.rate).toFixed(2),
+        String(Math.round(sum.ms / 60000)),
+      ].join(','),
+    )
+  }
+  return lines.join('\n')
 }
 
 /** Every day of the year `today` falls in, January 1 first, with its task count (null past today). */
@@ -549,6 +653,11 @@ export function cleanDay(raw: unknown): DayRecord | null {
   if (r.projects && typeof r.projects === 'object') {
     day.projects = {}
     for (const [p, v] of Object.entries(r.projects)) if (typeof v === 'number' && v > 0) day.projects[p] = v
+  }
+  const extra = raw as { ms?: unknown; hours?: unknown }
+  if (typeof extra.ms === 'number' && extra.ms >= 0) day.ms = extra.ms
+  if (Array.isArray(extra.hours) && extra.hours.length === 24 && extra.hours.every(n => typeof n === 'number' && n >= 0)) {
+    day.hours = extra.hours as number[]
   }
   return day
 }

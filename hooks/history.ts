@@ -49,9 +49,13 @@ def finish(t):
         if m not in model_ix: model_ix[m] = len(models); models.append(m)
         c = t['cwd'] or ''
         if c not in cwd_ix: cwd_ix[c] = len(cwds); cwds.append(c)
-        tasks.append([int(t['ts']), model_ix[m], sorted(t['uses']), cwd_ix[c]])
+        worked = max(0, int(t['last'] - t['ts'])) if t['last'] else 0
+        tasks.append([int(t['ts']), model_ix[m], sorted(t['uses']), cwd_ix[c], worked])
 
+earliest = None
+sessions = set()
 for path in glob.glob(os.path.join(root, '*', '*.jsonl')):
+    sessions.add(os.path.splitext(os.path.basename(path))[0])
     cur = None
     try: fh = open(path, encoding='utf-8', errors='replace')
     except Exception: continue
@@ -76,8 +80,9 @@ for path in glob.glob(os.path.join(root, '*', '*.jsonl')):
                     finish(cur); cur = None; continue
                 ts = ts_of(o)
                 if ts is None: continue
+                if earliest is None or ts < earliest: earliest = ts
                 finish(cur)
-                cur = {'ts': ts, 'cwd': o.get('cwd'), 'hash': hashlib.md5(text[:400].encode('utf-8', 'replace')).hexdigest()[:10],
+                cur = {'ts': ts, 'last': None, 'cwd': o.get('cwd'), 'hash': hashlib.md5(text[:400].encode('utf-8', 'replace')).hexdigest()[:10],
                        'uses': set(), 'model': None, 'answered': False, 'aborted': False}
             elif kind == 'assistant' and cur is not None:
                 m = o.get('message') or {}
@@ -85,6 +90,8 @@ for path in glob.glob(os.path.join(root, '*', '*.jsonl')):
                 # The app's own stand-in replies (errors, "no response") are no answer.
                 if model == '<synthetic>': continue
                 if model: cur['model'] = model
+                at = ts_of(o)
+                if at is not None and at >= cur['ts']: cur['last'] = at
                 for b in m.get('content') or []:
                     if not isinstance(b, dict): continue
                     if b.get('type') == 'text' and (b.get('text') or '').strip(): cur['answered'] = True
@@ -98,12 +105,37 @@ for path in glob.glob(os.path.join(root, '*', '*.jsonl')):
                             cur['uses'].add('file:' + f.rsplit('.', 1)[1].lower()[:8])
         finish(cur)
 
-json.dump({'models': models, 'cwds': cwds, 'tasks': tasks}, sys.stdout, separators=(',', ':'))
+# Claude Code deletes old transcripts (cleanupPeriodDays, 30 by default) but keeps
+# the prompts typed in a terminal in history.jsonl. A session whose transcript is
+# gone still counts its typed prompts, its kind and model unknown.
+history = os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude'), 'history.jsonl')
+try:
+    with open(history, encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            try: o = json.loads(line)
+            except Exception: continue
+            if not isinstance(o, dict) or o.get('sessionId') in sessions: continue
+            text = str(o.get('display') or '').strip()
+            ts = o.get('timestamp')
+            if not text or text.startswith('/') or not isinstance(ts, (int, float)) or ts >= until: continue
+            if earliest is None or ts < earliest: earliest = ts
+            finish({'ts': float(ts), 'last': None, 'cwd': o.get('project'), 'hash': hashlib.md5(text[:400].encode('utf-8', 'replace')).hexdigest()[:10],
+                    'uses': set(), 'model': 'unknown', 'answered': True, 'aborted': False})
+except OSError:
+    pass
+
+json.dump({'models': models, 'cwds': cwds, 'tasks': tasks, 'earliest': earliest}, sys.stdout, separators=(',', ':'))
 `
 
 import type { ToolUse } from './logic'
 
-export type Scan = { models: string[]; cwds: string[]; tasks: Array<[number, number, string[], number?]> }
+export type Scan = {
+  models: string[]
+  cwds: string[]
+  tasks: Array<[number, number, string[], number?, number?]>
+  /** The earliest moment the history still covers; days before it are kept as stored. */
+  earliest: number | null
+}
 
 /** One scanned task's tokens back into the tool uses `classify` reads. */
 export function usesOf(tokens: readonly string[]): ToolUse[] {
@@ -119,7 +151,8 @@ export function parseScan(text: string): Scan | null {
     const raw = JSON.parse(text) as Partial<Scan>
     if (!Array.isArray(raw.models) || !Array.isArray(raw.tasks)) return null
     const cwds = Array.isArray(raw.cwds) ? raw.cwds.map(String) : []
-    return { models: raw.models.map(String), cwds, tasks: raw.tasks as Scan['tasks'] }
+    const earliest = typeof raw.earliest === 'number' ? raw.earliest : null
+    return { models: raw.models.map(String), cwds, tasks: raw.tasks as Scan['tasks'], earliest }
   } catch {
     return null
   }

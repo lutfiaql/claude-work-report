@@ -7,6 +7,10 @@ export type DayRecord = {
   kinds: Partial<Record<KindId, number>>
   models: Record<string, number>
   projects?: Record<string, number>
+  /** Milliseconds Claude spent working on the day's tasks. */
+  ms?: number
+  /** Tasks by the local hour they started, 24 counts from midnight. */
+  hours?: number[]
 }
 
 /** The estimate's inputs: minutes saved per task of each kind, and the hourly rate. */

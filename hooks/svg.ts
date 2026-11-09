@@ -173,12 +173,15 @@ export function chartSvg(width: number, title: string, chart: Chart, labels: rea
   const showValues = n <= 12 && slot >= 22
   const active = chart.values.filter((v, i) => !chart.future[i])
   const average = active.length > 0 ? active.reduce((a, b) => a + b, 0) / active.length : 0
+  // The average line and its label go over the bars: drawn after them.
+  let overlay = ''
   if (n > 7 && average > 0) {
     const ay = base - (average / max) * plotH
     const label = `avg ${average < 10 ? average.toFixed(1) : Math.round(average)}`
-    body +=
+    overlay +=
       `<line x1="0" x2="${width}" y1="${ay.toFixed(1)}" y2="${ay.toFixed(1)}" stroke="${MUTED}" stroke-width="1" stroke-dasharray="3 4" opacity="0.7"/>` +
-      `<text x="${width}" y="${(ay - 4).toFixed(1)}" fill="${MUTED}" font-size="10" text-anchor="end">${label}</text>`
+      `<rect x="${(width - textPx(label, 10) - 8).toFixed(1)}" y="${(ay - 15).toFixed(1)}" width="${(textPx(label, 10) + 8).toFixed(1)}" height="14" rx="3" fill="#0D1117" opacity="0.9"/>` +
+      `<text x="${width - 4}" y="${(ay - 4.5).toFixed(1)}" fill="${MUTED}" font-size="10" text-anchor="end">${label}</text>`
   }
   chart.values.forEach((v, i) => {
     const cx = slot * i + slot / 2
@@ -206,12 +209,13 @@ export function chartSvg(width: number, title: string, chart: Chart, labels: rea
       body += `<text x="${cx.toFixed(1)}" y="${base + 16}" fill="${isCurrent ? TEXT : MUTED}" font-size="11"${isCurrent ? ' font-weight="600"' : ''} text-anchor="middle">${esc(label)}</text>`
     }
   })
+  body += overlay
   return svg(width, height, body)
 }
 
-function roundedTop(x: number, y: number, w: number, h: number, r: number): string {
-  const rr = Math.min(r, h)
-  return `M${x.toFixed(1)},${(y + h).toFixed(1)} V${(y + rr).toFixed(1)} Q${x.toFixed(1)},${y.toFixed(1)} ${(x + rr).toFixed(1)},${y.toFixed(1)} H${(x + w - rr).toFixed(1)} Q${(x + w).toFixed(1)},${y.toFixed(1)} ${(x + w).toFixed(1)},${(y + rr).toFixed(1)} V${(y + h).toFixed(1)} Z`
+function roundedTop(x: number, y: number, w: number, barH: number, r: number): string {
+  const rr = Math.min(r, barH)
+  return `M${x.toFixed(1)},${(y + barH).toFixed(1)} V${(y + rr).toFixed(1)} Q${x.toFixed(1)},${y.toFixed(1)} ${(x + rr).toFixed(1)},${y.toFixed(1)} H${(x + w - rr).toFixed(1)} Q${(x + w).toFixed(1)},${y.toFixed(1)} ${(x + w).toFixed(1)},${(y + rr).toFixed(1)} V${(y + barH).toFixed(1)} Z`
 }
 
 

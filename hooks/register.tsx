@@ -27,20 +27,26 @@ import {
   bigText,
   changePercent,
   chartFor,
+  clockHour,
+  csvOf,
   classify,
   cleanDay,
   cleanSettings,
   dayKey,
   fit,
   formatChange,
+  formatDuration,
   formatHours,
   formatMoney,
   hbar,
   isTypedOrigin,
+  leverage,
+  longestStreak,
   minutesOf,
   monthName,
   monthTotals,
   noonOf,
+  peakWindow,
   PREVIOUS_LABEL,
   prettyModel,
   previousKeys,
@@ -62,13 +68,13 @@ const PANE = 'work-report'
 const TITLE = 'Work report'
 const SETTINGS_KEY = 'settings'
 const HISTORY_KEY = 'history'
-const HISTORY_VERSION = 2
+const HISTORY_VERSION = 3
 
 const tabAtom = atom({ plugin: 'work-report', key: 'tab' } as const, 'today' as TabId)
 // Change a tag when that value's fields change: it declines what an earlier
 // version stored, which outlives a reload.
 const daysAtom = atom({ plugin: 'work-report', key: 'days' } as const, {} as Record<string, DayRecord>, {
-  shape: 'days-2',
+  shape: 'days-3',
 })
 const settingsAtom = atom({ plugin: 'work-report', key: 'settings' } as const, DEFAULT_SETTINGS, {
   shape: 'settings-1',
@@ -109,15 +115,32 @@ async function loadFromStore($: EngineInterface): Promise<void> {
   await update($, settingsAtom, () => cfg)
 }
 
+type LiveTask = { key: string; kind: KindId; model: string; project: string; ms: number; hour: number }
+
+// A rebuild replaces whole days in the store. A task that finishes while one
+// runs waits here and is written once the rebuild is done, so the rebuild
+// neither drops it nor, written twice, counts it twice.
+let rebuilding = 0
+const waiting: LiveTask[] = []
+
 /** Adds one finished task to today's record in the store and the session's state. */
-async function recordTask($: EngineInterface, kind: KindId, model: string): Promise<void> {
-  const key = dayKey(await $.clock.now())
+async function recordTask($: EngineInterface, kind: KindId, model: string, workedMs: number): Promise<void> {
+  const now = await $.clock.now()
   // A task still counts when the folder cannot be read.
   const project = projectName(await $.session.cwd().catch(() => undefined))
-  const stored = cleanDay(await $.store.get(`day:${key}`))
-  const day = addTask(stored ?? undefined, kind, model, project)
-  await $.store.set(`day:${key}`, day)
-  await update($, daysAtom, all => ({ ...all, [key]: day }))
+  const task: LiveTask = { key: dayKey(now), kind, model, project, ms: workedMs, hour: new Date(now - workedMs).getHours() }
+  if (rebuilding > 0) {
+    waiting.push(task)
+    return
+  }
+  await writeTask($, task)
+}
+
+async function writeTask($: EngineInterface, task: LiveTask): Promise<void> {
+  const stored = cleanDay(await $.store.get(`day:${task.key}`))
+  const day = addTask(stored ?? undefined, task.kind, task.model, task.project, { ms: task.ms, hour: task.hour })
+  await $.store.set(`day:${task.key}`, day)
+  await update($, daysAtom, all => ({ ...all, [task.key]: day }))
 }
 
 /**
@@ -125,6 +148,24 @@ async function recordTask($: EngineInterface, kind: KindId, model: string): Prom
  * replacing what the store held for those days. Resolves how many tasks it found.
  */
 async function rebuildFromHistory($: EngineInterface, until: number): Promise<number> {
+  rebuilding += 1
+  try {
+    return await replaceFromHistory($, until)
+  } finally {
+    // The last rebuild to end writes what waited. The queue is checked and the
+    // count lowered with no wait between, so a task finishing after this is
+    // written directly.
+    if (rebuilding === 1) {
+      while (waiting.length > 0) {
+        const task = waiting.shift()
+        if (task) await writeTask($, task).catch(() => undefined)
+      }
+    }
+    rebuilding -= 1
+  }
+}
+
+async function replaceFromHistory($: EngineInterface, until: number): Promise<number> {
   const ran = await $.process.run(['/usr/bin/env', 'python3', '-I', '-', String(until)], {
     stdin: SCAN_SCRIPT,
     timeoutMs: 180_000,
@@ -132,16 +173,26 @@ async function rebuildFromHistory($: EngineInterface, until: number): Promise<nu
   const scan = ran.exitCode === 0 && !ran.isStdoutTruncated ? parseScan(ran.stdout) : null
   if (scan === null) throw new Error('history scan failed')
   const days: Record<string, DayRecord> = {}
-  for (const [ts, modelIndex, tokens, cwdIndex] of scan.tasks) {
+  for (const [ts, modelIndex, tokens, cwdIndex, worked] of scan.tasks) {
     const key = dayKey(ts)
     const project = projectName(cwdIndex === undefined ? undefined : scan.cwds[cwdIndex])
-    days[key] = addTask(days[key], classify(usesOf(tokens)), scan.models[modelIndex] ?? 'unknown', project)
+    days[key] = addTask(days[key], classify(usesOf(tokens)), scan.models[modelIndex] ?? 'unknown', project, {
+      ms: worked,
+      hour: new Date(ts).getHours(),
+    })
   }
-  // The history holds every task up to `until`, those recorded live included:
-  // it replaces the store's days up to then. Later tasks are recorded live.
+  // The history holds every task from its earliest record up to `until`, those
+  // recorded live included: it replaces the store's days in that stretch. Days
+  // before it (their transcripts since cleaned up by Claude Code) are kept as
+  // stored, and tasks after `until` are recorded live.
   const untilKey = dayKey(until)
-  for (const key of (await $.store.keys()).filter(k => k.startsWith('day:'))) {
-    if (key.slice(4) <= untilKey) await $.store.delete(key)
+  // With no history at all, nothing stored is replaced.
+  if (scan.earliest !== null) {
+    const fromKey = dayKey(scan.earliest)
+    for (const key of (await $.store.keys()).filter(k => k.startsWith('day:'))) {
+      const day = key.slice(4)
+      if (day >= fromKey && day <= untilKey) await $.store.delete(key)
+    }
   }
   for (const [key, day] of Object.entries(days)) await $.store.set(`day:${key}`, day)
   await $.store.set(HISTORY_KEY, { version: HISTORY_VERSION, at: until, tasks: scan.tasks.length })
@@ -182,7 +233,13 @@ type View = {
   chartTitle: string
   summary: string
   summaryColor: string
+  /** Claude's measured working time, and the estimate over it. */
+  worked: string
+  hours: number[]
+  peak: string | null
   footer: string
+  /** Plain text to paste anywhere. */
+  share: string
 }
 
 function viewOf(tab: TabId, all: Record<string, DayRecord>, cfg: typeof DEFAULT_SETTINGS, today: string): View {
@@ -203,7 +260,9 @@ function viewOf(tab: TabId, all: Record<string, DayRecord>, cfg: typeof DEFAULT_
   if (tab === 'today' || tab === 'week') {
     const days = streak(all, today)
     summaryColor = days > 0 ? GREEN : MUTED
-    summary = days === 0 ? 'No streak yet.' : days === 1 ? 'Streak: 1 day.' : `Streak: ${days} days in a row.`
+    const longest = longestStreak(all)
+    const best = longest > days ? ` · longest ${longest}` : ''
+    summary = days === 0 ? `No streak yet${best ? `.${best}` : '.'}` : days === 1 ? `Streak: 1 day${best}` : `Streak: ${days} days in a row${best}`
   } else if (tab === 'month') {
     const best = bestDay(all, keys)
     const active = activeDays(all, keys)
@@ -233,6 +292,25 @@ function viewOf(tab: TabId, all: Record<string, DayRecord>, cfg: typeof DEFAULT_
   if (rest > 0) {
     projects.push({ label: `${projectList.length - 5} more`, value: rest, color: HAIRLINE, right: share(rest), dim: true })
   }
+
+  const lever = leverage(minutes, sum.ms)
+  const worked =
+    sum.ms >= 60000
+      ? `Claude worked ${formatDuration(sum.ms)} on these${lever ? ` · about ${lever} that back in your time (estimate)` : ''}`
+      : ''
+  const peak = peakWindow(sum.hours)
+  const topKinds = KINDS.filter(k => sum.kinds[k.id] > 0)
+    .sort((a, b) => sum.kinds[b.id] - sum.kinds[a.id])
+    .slice(0, 3)
+    .map(k => `${k.label} ${sum.kinds[k.id]}`)
+  const shareText = [
+    `Work report · ${TAB_TITLES[tab].charAt(0)}${TAB_TITLES[tab].slice(1).toLowerCase()} (${rangeLabel(tab, today)})`,
+    `${withCommas(sum.total)} tasks finished · about ${formatHours(minutes)} hours saved · worth about ${formatMoney(minutes, cfg.rate)} (estimate at $${cfg.rate}/h)`,
+    topKinds.length > 0 ? topKinds.join(' · ') : '',
+    worked,
+  ]
+    .filter(Boolean)
+    .join('\n')
 
   return {
     tab,
@@ -269,7 +347,11 @@ function viewOf(tab: TabId, all: Record<string, DayRecord>, cfg: typeof DEFAULT_
     chartTitle: tab === 'year' ? 'BY MONTH' : tab === 'month' ? 'BY DAY' : 'BY WEEKDAY',
     summary,
     summaryColor,
+    worked,
+    hours: sum.hours,
+    peak: peak ? `Busiest ${peak.label}` : null,
     footer: `Estimate: minutes saved per task at $${cfg.rate}/h. /report settings to change.`,
+    share: shareText,
   }
 }
 
@@ -286,6 +368,10 @@ function graphicLabels(view: View, today: string, width: number): string[] {
   }
   return keys.map(k => weekdayOf(k))
 }
+
+const HOUR_LABELS = Array.from({ length: 24 }, (_, hour) =>
+  hour % 6 === 0 ? (hour === 0 ? '12a' : hour === 12 ? '12p' : hour < 12 ? `${hour}a` : `${hour - 12}p`) : '',
+)
 
 // ------------------------------------------------------------ layout helpers
 
@@ -329,7 +415,7 @@ export const register: Register = on => {
       await $.command.register({
         name: 'report',
         description: 'Open the work report: tasks done and the time they saved (estimate)',
-        argumentHint: '[today|week|month|year|settings|rebuild]',
+        argumentHint: '[today|week|month|year|settings|copy|export|rebuild]',
         immediate: true,
       })
     } catch {
@@ -379,7 +465,7 @@ export const register: Register = on => {
       current = null
       if (turn.isTyped && e.reason === 'answer' && !e.isAborted) {
         try {
-          await recordTask($, classify(turn.uses), e.usage?.model ?? 'unknown')
+          await recordTask($, classify(turn.uses), e.usage?.model ?? 'unknown', e.durationMs)
         } catch {
           // A failed write loses this one task; the turn goes on.
         }
@@ -405,6 +491,24 @@ export const register: Register = on => {
         }
         return { text: result.text }
       }
+      if (word === 'copy' || word === 'export') {
+        await loadFromStore($)
+        const tab = await read($, tabAtom)
+        const all = await read($, daysAtom)
+        const cfg = await read($, settingsAtom)
+        const today = dayKey(await $.clock.now())
+        const text = word === 'copy' ? viewOf(tab, all, cfg, today).share : csvOf(all, rangeKeys('year', today), cfg)
+        const copied = await $.ui.copy({ text }).catch(() => ({ isCopied: false }))
+        if (copied.isCopied) {
+          return {
+            text:
+              word === 'copy'
+                ? `Copied the ${TAB_TITLES[tab].toLowerCase()} summary to your clipboard.`
+                : 'Copied this year as CSV (one row per active day) to your clipboard.',
+          }
+        }
+        return { text: `Your clipboard could not be reached, so here it is:\n\n${text}` }
+      }
       if (word === 'rebuild') {
         void (async () => {
           await rebuildFromHistory($, runningSince() ?? (await $.clock.now()))
@@ -418,7 +522,7 @@ export const register: Register = on => {
         return { text: 'Opening your work report. Hours and dollars are estimates.' }
       }
       return {
-        text: 'Use /report to open the pane, /report week (or today, month, year) to open a tab, /report settings to see and change the estimate, or /report rebuild to recount from your session history.',
+        text: 'Use /report to open the pane, /report week (or today, month, year) to open a tab, /report settings to see and change the estimate, /report copy for a summary to paste, /report export for this year as CSV, or /report rebuild to recount from your session history.',
       }
     } catch {
       return { text: 'The work report could not do that just now. Try /report again in a moment.' }
@@ -494,10 +598,13 @@ export const register: Register = on => {
         <Box flexDirection="column" gap="md">
           {tabs}
           {header}
-          <Svg
-            source={tilesSvg(px, view.tiles)}
-            alt={view.tiles.map(t => `${t.label} ${t.value} (${t.note})`).join(', ')}
-          />
+          <Box flexDirection="column" gap="xs">
+            <Svg
+              source={tilesSvg(px, view.tiles)}
+              alt={view.tiles.map(t => `${t.label} ${t.value} (${t.note}${t.change ? `, ${t.change.text}` : ''})`).join(', ')}
+            />
+            {view.worked !== '' && <Text color={MUTED}>{view.worked}</Text>}
+          </Box>
           <Svg
             source={barsSvg(px, 'WHERE THE TIME WENT', view.kinds, true)}
             alt={`Where the time went: ${view.kinds.map(k => `${k.label} ${k.value} tasks, ${k.right}`).join('; ')}`}
@@ -520,15 +627,29 @@ export const register: Register = on => {
               {view.summary}
             </Text>
           </Box>
+          {view.peak !== null && (
+            <Box flexDirection="column" gap="xs">
+              <Svg
+                source={chartSvg(px, 'WHEN YOU WORK', { values: view.hours, labels: [], current: -1, future: [] }, HOUR_LABELS)}
+                alt={`When you work: ${view.hours.map((n, hour) => `${clockHour(hour)} ${n}`).join(', ')}`}
+              />
+              <Text color={MUTED}>{view.peak}</Text>
+            </Box>
+          )}
           {view.tab === 'year' && (
             <Svg
               source={heatmapSvg(px, 'EVERY DAY THIS YEAR', view.year, noonOf(`${today.slice(0, 4)}-01-01`).getDay(), today)}
               alt={`Every day this year: ${view.year.filter(d => (d.total ?? 0) > 0).length} active days`}
             />
           )}
-          <Text color={MUTED} size="footnote">
-            {view.footer}
-          </Text>
+          <Box flexDirection="row" gap="sm" alignItems="center">
+            <Button key="copy-summary" plain onPress={press => void $.ui.copy({ text: view.share, surface: press.surface })}>
+              <Text backgroundColor={HAIRLINE} color={TEXT}> Copy summary </Text>
+            </Button>
+            <Text color={MUTED} size="footnote">
+              {view.footer}
+            </Text>
+          </Box>
         </Box>
       )
     }
@@ -589,7 +710,7 @@ export const register: Register = on => {
               <Text> </Text>,
             ]
           )}
-          <Text color={MUTED}>{fit(t.note, inner).trimEnd()}</Text>
+          <Text color={MUTED}>{fit(textWidth(t.note) <= inner ? t.note : 'estimate', inner).trimEnd()}</Text>
           {hasChange && <Text color={t.change?.color ?? MUTED}>{fit(t.change?.text ?? '', inner).trimEnd() || ' '}</Text>}
         </Box>
       )
@@ -641,6 +762,22 @@ export const register: Register = on => {
         <Text color={MUTED}>{p.right.padStart(hoursW)}</Text>
       </Text>
     ))
+
+    // When you work: one row, an hour (or two, when narrow) per cell.
+    const buckets = width >= 24 ? view.hours : view.hours.reduce<number[]>((acc, n, hour) => {
+      acc[Math.floor(hour / 2)] = (acc[Math.floor(hour / 2)] ?? 0) + n
+      return acc
+    }, [])
+    const cellW = Math.max(1, Math.floor(width / buckets.length))
+    const maxHour = Math.max(1, ...buckets)
+    const hourStrip = buckets.map(n => barCell(n, maxHour, 0, 1).repeat(cellW)).join('')
+    const hourLabels =
+      width >= 24 && cellW >= 2
+        ? [0, 6, 12, 18]
+            .map(hour => fit(hour === 0 ? '12a' : hour === 12 ? '12p' : hour < 12 ? `${hour}a` : `${hour - 12}p`, cellW * 6))
+            .join('')
+            .trimEnd()
+        : ''
 
     // The chart, three rows tall.
     const chart = view.chart
@@ -716,7 +853,25 @@ export const register: Register = on => {
             <Text color={view.summaryColor}>{line}</Text>
           ))}
         </Box>
+        {view.peak !== null && (
+          <Box flexDirection="column">
+            {heading('WHEN YOU WORK')}
+            <Text color={BAR}>{hourStrip}</Text>
+            {hourLabels !== '' && <Text color={MUTED}>{hourLabels}</Text>}
+            <Text color={MUTED}>{fit(view.peak, width).trimEnd()}</Text>
+          </Box>
+        )}
+        {view.worked !== '' && (
+          <Box flexDirection="column">
+            {wrapWords(view.worked, width).map(line => (
+              <Text color={MUTED}>{line}</Text>
+            ))}
+          </Box>
+        )}
         <Box flexDirection="column">
+          <Button key="copy-summary" plain onPress={press => void $.ui.copy({ text: view.share, surface: press.surface })}>
+            <Text backgroundColor={HAIRLINE} color={TEXT}>{width >= 16 ? ' Copy summary ' : ' Copy '}</Text>
+          </Button>
           {wrapWords(view.footer, width).map(line => (
             <Text color={MUTED}>{line}</Text>
           ))}

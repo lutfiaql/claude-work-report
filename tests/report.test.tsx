@@ -3,8 +3,17 @@ import type { On } from 'claude-code'
 
 import {
   addDays,
+  addTask,
   changePercent,
   classify,
+  cleanDay,
+  clockHour,
+  csvOf,
+  DEFAULT_SETTINGS,
+  formatDuration,
+  leverage,
+  longestStreak,
+  peakWindow,
   formatChange,
   previousKeys,
   projectName,
@@ -259,7 +268,7 @@ test('each tab draws its own title and chart in the terminal', async ($, on) => 
     let text = (await rowsOf(ui)).join('\n')
     expect(text).toContain('TODAY')
     expect(text).toContain('Mon Nov 9, 2026')
-    expect(text).toContain('Streak: 2 days in a row.')
+    expect(text).toContain('Streak: 2 days in a row')
     expect(text).toContain('Mo') // the last seven days by weekday
 
     await ui.press({ key: 'tab-week' })
@@ -414,6 +423,7 @@ test('past days are rebuilt from the session history', async ($, on) => {
   const at = (d: number, hour: number) => new Date(2026, 10, d, hour).getTime()
   const scan = {
     models: ['claude-opus-5-5', 'claude-sonnet-5-5'],
+    earliest: at(2, 10),
     tasks: [
       [at(2, 10), 0, ['WebSearch']],
       [at(2, 11), 1, ['Skill', 'skill:anthropic-skills:docx']],
@@ -502,4 +512,179 @@ test('tiles show the change, projects are listed, and the year has a heatmap', a
     for (const line of lines) expect([...line].length <= width ? 'fits' : `too wide: ${line}`).toBe('fits')
     await term.unmount()
   }
+})
+
+// ------------------------------------------------------------------ round three
+
+test('the longest streak, the busiest hours, and measured time', async () => {
+  const days: Record<string, DayRecord> = {
+    '2026-10-01': day({ other: 1 }),
+    '2026-10-02': day({ other: 1 }),
+    '2026-10-03': day({ other: 1 }),
+    '2026-10-04': day({ other: 1 }),
+    '2026-10-06': day({ other: 1 }),
+    '2026-11-08': day({ other: 1 }),
+    '2026-11-09': day({ other: 1 }),
+  }
+  expect(longestStreak(days)).toBe(4)
+  expect(longestStreak({})).toBe(0)
+  const hours = new Array<number>(24).fill(0)
+  hours[15] = 5
+  hours[16] = 4
+  hours[9] = 6
+  expect(peakWindow(hours)?.label).toBe('3 pm – 5 pm')
+  expect(peakWindow(new Array<number>(24).fill(0))).toBe(null)
+  expect(clockHour(0)).toBe('12 am')
+  expect(clockHour(12)).toBe('12 pm')
+  expect(clockHour(23)).toBe('11 pm')
+  expect(formatDuration(30_000)).toBe('<1 min')
+  expect(formatDuration(45 * 60_000)).toBe('45 min')
+  expect(formatDuration(3.2 * 3_600_000)).toBe('3.2 h')
+  expect(leverage(600, 60 * 60_000)).toBe('10×')
+  expect(leverage(90, 60 * 60_000)).toBe('1.5×')
+  expect(leverage(90, 0)).toBe(null)
+})
+
+test('a task adds its working time and hour; odd stored values are dropped', async () => {
+  let d = addTask(undefined, 'coding', 'm', 'atlas', { ms: 120_000, hour: 15 })
+  d = addTask(d, 'coding', 'm', 'atlas', { ms: 9 * 3_600_000, hour: 15 })
+  expect(d.ms).toBe(120_000 + 4 * 3_600_000) // a session left open counts at most 4 hours
+  expect(d.hours?.[15]).toBe(2)
+  expect(cleanDay({ kinds: { coding: 2 }, models: {}, ms: 5, hours: [1, 2] })?.hours).toBe(undefined)
+  expect(cleanDay({ kinds: { coding: 2 }, models: {}, ms: -5 })?.ms).toBe(undefined)
+  expect(cleanDay({ kinds: { coding: 'x', other: 1 }, models: { a: 1 } })).toEqual({ kinds: { other: 1 }, models: { a: 1 } })
+  expect(cleanDay(null)).toBe(null)
+  const csv = csvOf({ '2026-11-09': d }, ['2026-11-08', '2026-11-09'], DEFAULT_SETTINGS).split('\n')
+  expect(csv[0]).toBe('date,emails,documents,images,coding,research,other,tasks,minutes_saved_estimate,value_estimate,claude_minutes')
+  expect(csv[1]).toBe('2026-11-09,0,0,0,2,0,0,2,40,33.33,242')
+  expect(csv).toHaveLength(2)
+})
+
+test('the pane shows Claude\'s working time, the busiest hours, and copies a summary', async ($, on) => {
+  const hours = new Array<number>(24).fill(0)
+  hours[15] = 3
+  const clock = engine(on, {
+    [`day:${TODAY}`]: { kinds: { coding: 3 }, models: { 'claude-opus-5-5': 3 }, ms: 30 * 60_000, hours },
+  })
+  const copied: string[] = []
+  on('ui.copy', (_, e) => {
+    copied.push(e.text)
+    return { value: { isCopied: true } }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...paneAt(surface === 'terminal' ? 60 : 90), surface })
+    await ui.press({ key: 'tab-today' })
+    const lines = (await rowsOf(ui)).join(' ')
+    expect(lines).toContain('Claude worked 30 min on these · about 2.0× that back in your time (estimate)')
+    expect(lines).toContain('Busiest 3 pm – 5 pm')
+    // A note that does not fit its tile is shortened, never cut mid-number.
+    expect(lines).not.toMatch(/\$\d*…/)
+    await ui.press({ key: 'copy-summary' })
+    await ui.unmount()
+  }
+  expect(copied).toHaveLength(2)
+  expect(copied[0]).toContain('3 tasks finished · about 1 hours saved · worth about $50 (estimate at $50/h)')
+  expect(copied[0]).toContain('Coding 3')
+
+  const viaCommand = await $.command.run({ command: 'report', args: 'export' } as never)
+  expect(viaCommand.text).toContain('Copied this year as CSV')
+  expect(copied[2]).toContain(`${TODAY},0,0,0,3,0,0,3,60,50.00,30`)
+})
+
+test('a rebuild keeps saved days older than the history it can still read', async ($, on) => {
+  const at = (d: number, hour: number) => new Date(2026, 10, d, hour).getTime()
+  const clock = engine(on, {
+    'day:2026-03-15': day({ documents: 4 }), // saved long ago; Claude Code has since deleted its transcript
+    'day:2026-11-02': day({ other: 9 }), // inside the history: replaced by what the history says
+  })
+  on('process.run', () => ({
+    value: {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        models: ['claude-opus-5-5'],
+        cwds: ['/Users/me/atlas'],
+        earliest: at(2, 9),
+        tasks: [[at(2, 10), 0, ['Bash'], 0, 60_000]],
+      }),
+      stderr: '',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...paneAt(90), surface: 'desktop' })
+  await ui.press({ key: 'tab-year' })
+  const all = (await ui.findAll({ type: 'Svg' })).map(s => String(s.props.alt)).join('\n')
+  expect(all).toContain('TASKS DONE 5') // March's 4 kept, November 2 now its 1
+  expect(all).toContain('Documents 4 tasks')
+  expect(all).toContain('Coding 1 tasks')
+  await ui.unmount()
+})
+
+test('a rebuild with no history at all replaces nothing', async ($, on) => {
+  const clock = engine(on, { 'day:2026-03-15': day({ documents: 4 }), 'day:2026-11-02': day({ other: 9 }) })
+  on('process.run', () => ({
+    value: {
+      exitCode: 0,
+      stdout: JSON.stringify({ models: [], cwds: [], tasks: [], earliest: null }),
+      stderr: '',
+      isStdoutTruncated: false,
+      isStderrTruncated: false,
+    },
+  }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...paneAt(90), surface: 'desktop' })
+  await ui.press({ key: 'tab-year' })
+  const all = (await ui.findAll({ type: 'Svg' })).map(s => String(s.props.alt)).join('\n')
+  expect(all).toContain('TASKS DONE 13')
+  await ui.unmount()
+})
+
+test('a task that finishes while history is being rebuilt is neither lost nor counted twice', async ($, on) => {
+  let release: () => void = () => undefined
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const clock = engine(on, { [`day:${TODAY}`]: day({ other: 2 }) })
+  on('process.run', async () => {
+    await gate // the history scan is still running
+    return {
+      value: {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          models: ['claude-opus-5-5'],
+          cwds: ['/Users/me/atlas'],
+          earliest: NOW - 3_600_000,
+          tasks: [[NOW - 3_600_000, 0, ['WebSearch'], 0, 60_000]],
+        }),
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+
+  // A typed request finishes while the scan waits.
+  await $.prompt.submit({ text: 'draft the memo', wait: false, origin: { kind: 'composer' } } as never)
+  await $.turn.start({ text: 'draft the memo', turnId: 'r1' })
+  await $.tool.call({ tool: 'Write', file_path: '/tmp/memo.docx', content: 'x' } as never)
+  await $.turn.complete({ turnId: 'r1', answer: 'done', durationMs: 5000, isAborted: false, reason: 'answer', usage: { ...USAGE, model: 'claude-opus-5-5' } } as never)
+
+  release()
+  await clock.settle()
+  const ui = await $.ui.mount({ ...paneAt(90), surface: 'desktop' })
+  await ui.press({ key: 'tab-today' })
+  const all = (await ui.findAll({ type: 'Svg' })).map(s => String(s.props.alt)).join('\n')
+  // The history's one task (research) plus the live one (documents); the two
+  // old stored tasks were replaced by the history.
+  expect(all).toContain('TASKS DONE 2')
+  expect(all).toContain('Research 1 tasks')
+  expect(all).toContain('Documents 1 tasks')
+  await ui.unmount()
 })

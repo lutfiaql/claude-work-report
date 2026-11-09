@@ -1,0 +1,8 @@
+{
+  "name": "work-report",
+  "version": "0.2.0",
+  "description": "A pane that counts the tasks Claude finished for you and estimates the hours and dollars that saved",
+  "author": { "name": "lutfiaql" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

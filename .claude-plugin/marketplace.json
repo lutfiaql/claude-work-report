@@ -1,0 +1,13 @@
+{
+  "name": "claude-work-report",
+  "description": "Work Report: a Claude Code pane that counts the tasks Claude finished for you and estimates the hours and dollars saved.",
+  "owner": {
+    "name": "lutfiaql"
+  },
+  "plugins": [
+    {
+      "name": "work-report",
+      "source": "./"
+    }
+  ]
+}
